@@ -1,0 +1,14 @@
+an=[b for b in range(1,11)]
+bn=[]
+print(an)
+
+for a in an:
+	if a == 1:
+		bn.append(str(a)+'st')
+	elif a==2:
+		bn.append(str(a)+'nd')
+	elif a==3:
+		bn.append(str(a)+'rd')
+	else:
+		bn.append(str(a)+'th')
+print(bn)
