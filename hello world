@@ -1,14 +1,178 @@
-an=[b for b in range(1,101)]
-bn=[]
-print(an)
+import os
+import re
+import time
+import random
+import requests
+import csv
+from pathlib import Path
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from typing import List, Dict, Optional
 
-for a in an:
-	if a == 1:
-		bn.append(str(a)+'st')
-	elif a==2:
-		bn.append(str(a)+'nd')
-	elif a==3:
-		bn.append(str(a)+'rd')
-	else:
-		bn.append(str(a)+'th')
-print(bn)
+# 配置参数
+BASE_URL = "https://www.coze.cn/open/docs/guides/"
+OUTPUT_DIR = "coze_docs_data"
+DELAY_RANGE = (1, 3)
+MAX_RETRIES = 3
+REQUEST_TIMEOUT = 15
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
+]
+
+class CozeDocsScraper:
+    def __init__(self):
+        # 初始化输出目录
+        self.output_path = Path(OUTPUT_DIR)
+        self.output_path.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化日志文件
+        self.log_file = self.output_path / "crawl.log"
+        self._init_log()
+        
+        # 配置会话
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        })
+        self.visited_urls = set()
+
+    def _init_log(self):
+        """初始化日志文件"""
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*40} New Session {time.strftime('%Y-%m-%d %H:%M')} {'='*40}\n")
+
+    def _log(self, message: str, level: str = "INFO"):
+        """记录日志"""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {level} - {message}"
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(log_entry + "\n")
+        print(log_entry)
+
+    def _make_request(self, url: str) -> Optional[requests.Response]:
+        """带重试机制的请求函数"""
+        for attempt in range(1, MAX_RETRIES+1):
+            try:
+                response = self.session.get(
+                    url,
+                    timeout=REQUEST_TIMEOUT,
+                    verify=True  # 保持SSL验证
+                )
+                response.raise_for_status()
+                return response
+            except Exception as e:
+                self._log(f"请求失败 ({attempt}/{MAX_RETRIES}): {url} - {str(e)}", "WARNING")
+                if attempt < MAX_RETRIES:
+                    sleep_time = random.uniform(*DELAY_RANGE) * attempt
+                    time.sleep(sleep_time)
+        return None
+
+    def _extract_nav_links(self, soup: BeautifulSoup) -> List[str]:
+        """提取导航链接"""
+        def parse_nav_items(items, level=0):
+            links = []
+            for item in items:
+                if 'semi-collapse-item' in item.get('class', []):
+                    header = item.find(attrs={'role': 'button'})
+                    if header and header.get('aria-expanded') == "true":
+                        content = item.find('div', class_='semi-collapse-content')
+                        if content:
+                            links.extend(parse_nav_items(content.find_all('div', class_='menuItem'), level+1))
+                
+                link = item.find('a', href=True)
+                if link and link['href'].startswith('/open/docs/guides/'):
+                    full_url = urljoin(BASE_URL, link['href'])
+                    if full_url not in self.visited_urls:
+                        links.append(full_url)
+                        self.visited_urls.add(full_url)
+            return links
+
+        nav_container = soup.find('div', {'data-testid': 'docs-sidebar'})
+        return parse_nav_items(nav_container.find_all('div', class_='semi-collapse-item')) if nav_container else []
+
+    def _clean_content(self, text: str) -> str:
+        """内容清洗"""
+        # 移除不可见字符和特殊空白字符
+        text = re.sub(r'[\u200b-\u200f\u2028-\u202e]', '', text)
+        # 合并多余空白
+        return re.sub(r'\s{2,}', ' ', text).strip()
+
+    def scrape_guide_index(self) -> List[str]:
+        """爬取导航目录"""
+        self._log("开始爬取导航目录...")
+        response = self._make_request(BASE_URL)
+        if not response:
+            return []
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        guide_links = self._extract_nav_links(soup)
+        self._log(f"发现 {len(guide_links)} 个文档页面")
+        return guide_links
+
+    def scrape_guide_page(self, url: str) -> Optional[Dict]:
+        """爬取单个文档页面"""
+        self._log(f"开始处理: {url}")
+        response = self._make_request(url)
+        if not response:
+            return None
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 提取元数据
+        title_elem = soup.find('h1', class_=re.compile(r'text-24px|docs-title'))
+        breadcrumb = [self._clean_content(span.text) for span in soup.select('nav[aria-label="Breadcrumb"] span[class*="text-"]') if '>' not in span.text]
+        
+        # 提取内容
+        content_elem = soup.find('div', {'data-testid': 'docs-content'}) or soup.find('article', class_='docs-content')
+        content = ""
+        if content_elem:
+            for elem in content_elem.select('.code-block, .advertisement'):
+                elem.decompose()
+            content = self._clean_content(content_elem.get_text(separator='\n'))
+
+        return {
+            'title': self._clean_content(title_elem.text) if title_elem else "无标题",
+            'url': url,
+            'breadcrumb': ' > '.join(breadcrumb),
+            'content': content,
+            'last_updated': soup.find('time', datetime=True)['datetime'] if soup.find('time') else None
+        }
+
+    def save_to_csv(self, data: List[Dict]):
+        """保存数据到CSV"""
+        output_file = self.output_path / "coze_documentation.csv"
+        fieldnames = ['title', 'url', 'breadcrumb', 'content', 'last_updated']
+        
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(data)
+        self._log(f"数据已保存至: {output_file.resolve()}")
+
+    def run(self):
+        """运行主程序"""
+        start_time = time.time()
+        
+        if not (guide_urls := self.scrape_guide_index()):
+            self._log("导航目录解析失败，请检查网络或页面结构", "ERROR")
+            return
+
+        results = []
+        for idx, url in enumerate(guide_urls, 1):
+            if result := self.scrape_guide_page(url):
+                results.append(result)
+                self._log(f"进度: {idx}/{len(guide_urls)} - 已采集 {len(results)} 篇")
+            
+            time.sleep(random.uniform(*DELAY_RANGE))
+
+        if results:
+            self.save_to_csv(results)
+            self._log(f"爬取完成！共获取 {len(results)} 篇文档，耗时 {time.time()-start_time:.1f} 秒")
+        else:
+            self._log("未获取到有效数据", "WARNING")
+
+if __name__ == "__main__":
+    scraper = CozeDocsScraper()
+    scraper.run()
